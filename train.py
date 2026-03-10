@@ -37,10 +37,41 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    embed_rank: int = 64          # bottleneck rank for factorized embeddings
 
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
+
+
+class FactorizedEmbedding(nn.Module):
+    """
+    Drop-in replacement for nn.Embedding(vocab_size, embed_dim).
+    Stores a small V×r lookup table and projects r→embed_dim.
+    Memory: V*r + r*D instead of V*D  (e.g. 5.6× smaller at r=64, D=384).
+    """
+    def __init__(self, vocab_size: int, embed_dim: int, rank: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, rank)
+        self.proj  = nn.Linear(rank, embed_dim, bias=False)
+
+    def forward(self, idx):
+        return self.proj(self.embed(idx))
+
+
+class FactorizedLMHead(nn.Module):
+    """
+    Drop-in replacement for nn.Linear(embed_dim, vocab_size) used as lm_head.
+    Projects D→r→V instead of D→V directly.
+    Reduces both the memory footprint and the cost of the final large matmul.
+    """
+    def __init__(self, embed_dim: int, vocab_size: int, rank: int):
+        super().__init__()
+        self.down = nn.Linear(embed_dim, rank,       bias=False)
+        self.up   = nn.Linear(rank,      vocab_size, bias=False)
+
+    def forward(self, x):
+        return self.up(self.down(x))
 
 
 def has_ve(layer_idx, n_layer):
@@ -126,17 +157,17 @@ class GPT(nn.Module):
         self.config = config
         self.window_sizes = self._compute_window_sizes(config)
         self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(config.vocab_size, config.n_embd),
+            "wte": FactorizedEmbedding(config.vocab_size, config.n_embd, config.embed_rank),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = FactorizedLMHead(config.n_embd, config.vocab_size, config.embed_rank)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, kv_dim)
+            str(i): FactorizedEmbedding(config.vocab_size, kv_dim, config.embed_rank)
             for i in range(config.n_layer) if has_ve(i, config.n_layer)
         })
         # Rotary embeddings
@@ -148,11 +179,13 @@ class GPT(nn.Module):
     @torch.no_grad()
     def init_weights(self):
         # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        # Transformer blocks
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5
+        torch.nn.init.normal_(self.transformer.wte.embed.weight, mean=0.0, std=1.0)
+        torch.nn.init.uniform_(self.transformer.wte.proj.weight, -s, s)
+        torch.nn.init.orthogonal_(self.lm_head.down.weight, gain=0.01)
+        torch.nn.init.zeros_(self.lm_head.up.weight)
+        # Transformer blocks
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
@@ -165,7 +198,8 @@ class GPT(nn.Module):
         self.x0_lambdas.fill_(0.1)
         # Value embeddings
         for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
+            torch.nn.init.normal_(ve.embed.weight, mean=0.0, std=1.0)
+            torch.nn.init.uniform_(ve.proj.weight, -s, s)
         # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
@@ -175,13 +209,16 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
         # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
+        self.transformer.wte.embed.to(dtype=torch.bfloat16)
+        self.transformer.wte.proj.to(dtype=torch.bfloat16)
         for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+            ve.embed.to(dtype=torch.bfloat16)
+            ve.proj.to(dtype=torch.bfloat16)
+        self.lm_head.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
-            device = self.transformer.wte.weight.device
+            device = self.transformer.wte.embed.weight.device
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
         inv_freq = 1.0 / (base ** (channel_range / head_dim))
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
@@ -207,9 +244,12 @@ class GPT(nn.Module):
     def estimate_flops(self):
         """Estimated FLOPs per token (forward + backward)."""
         nparams = sum(p.numel() for p in self.parameters())
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
+        value_embeds_numel = sum(p.numel() for ve in self.value_embeds.values() for p in ve.parameters())
+        nparams_exclude = (
+            sum(p.numel() for p in self.transformer.wte.parameters())
+            + value_embeds_numel
+            + self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        )
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         t = self.config.sequence_len
@@ -447,6 +487,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
+EMBED_RANK = 64         # bottleneck rank for factorized embeddings (try 32, 64, 128)
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
@@ -473,6 +514,7 @@ def build_model_config(depth):
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
+        embed_rank=EMBED_RANK,
     )
 
 config = build_model_config(DEPTH)
