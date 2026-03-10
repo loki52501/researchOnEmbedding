@@ -1,12 +1,14 @@
-# autoresearch — RTX A4000 Fork
+# autoresearch — Embedding Optimization for Resource-Efficient Chat Models
 
 ![teaser](progress.png)
 
 *One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
 
-Fork of [karpathy/autoresearch](https://github.com/karpathy/autoresearch) adapted for **RTX A4000 (16 GB VRAM)** cloud kernels, with an active research thread on **resource-efficient embedding methods**.
+Fork of [karpathy/autoresearch](https://github.com/karpathy/autoresearch) adapted for **RTX A4000 (16 GB VRAM)** cloud kernels, with a focused research mission:
 
-The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model.
+> **Find the most resource-efficient embedding design that enables a small LLM to reach ChatGPT-like conversational quality on minimal hardware.**
+
+The autonomous agent runs 5-minute training experiments, modifies `train.py`, measures `val_bpb` and `peak_vram_mb`, keeps improvements, discards failures, and loops indefinitely. The embedding layer — which accounts for ~31% of all parameters in our baseline — is the primary target.
 
 ## What's different in this fork
 
@@ -25,24 +27,34 @@ A4000-tuned defaults (set via `autoresearch.ipynb`):
 | `TOTAL_BATCH_SIZE` | 2^19 | 2^17 |
 | `WINDOW_PATTERN` | SSSL | L |
 
-### 2. Factorized Embeddings research thread
+### 2. Embedding optimization research thread
 
-Active research on replacing standard `nn.Embedding(V, D)` with a low-rank factorized version `Embedding(V, r) → Linear(r, D)`, and similarly for the LM head.
+Active autonomous research on building the most resource-efficient embedding for a ChatGPT-like LLM. The agent works through a structured experiment ladder:
 
-**Motivation:** With DEPTH=6 and model_dim=384, embedding tables account for ~31% of all parameters and the LM head is the most expensive forward-pass operation. Factorization reduces both.
+| Tier | Ideas |
+|------|-------|
+| 1 | Sweep `EMBED_RANK` (32, 64, 96, 128) — find sweet spot |
+| 2 | Weight tying (`wte` ↔ `lm_head`), shared value embeddings |
+| 3 | Smarter init (orthogonal, scaled normal) |
+| 4 | Reinvest saved params into depth — more layers with smaller embeddings |
+| 5 | Gated projection (SiLU/ReLU between embed and proj) |
+| 6 | int8 quantized lookup table (bitsandbytes) |
+| 7 | Codebook/VQ embeddings (vector-quantize-pytorch) |
 
-**New hyperparameter:** `EMBED_RANK` (default 64) — controls the bottleneck rank. Sweep: 32, 64, 128.
+**Starting point — Factorized Embeddings (`EMBED_RANK=64`):**
 
-**Estimated savings at r=64:**
+Every `nn.Embedding(V, D)` is replaced with `Embedding(V, r) → Linear(r, D)`, and the LM head with `Linear(D, r) → Linear(r, V)`.
 
-| Component | Before | After | Reduction |
-|-----------|--------|-------|-----------|
+| Component | Standard | Factorized (r=64) | Reduction |
+|-----------|----------|-------------------|-----------|
 | `wte` | 3.1M | 548K | 5.6× |
 | `value_embeds` ×3 | 9.4M | 1.6M | 5.9× |
 | `lm_head` | 3.1M | 548K | 5.6× |
 | **Total** | **15.7M** | **~2.7M** | **5.8×** |
 
 Design doc: [`docs/plans/2026-03-10-factorized-embeddings-design.md`](docs/plans/2026-03-10-factorized-embeddings-design.md)
+
+**Why this matters for chat models:** Every MB saved in embedding tables means more VRAM headroom for a deeper model, longer context, or larger batch size at inference — all of which directly improve conversational quality.
 
 ### 3. Cloud notebook setup
 

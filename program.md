@@ -1,6 +1,10 @@
-# autoresearch
+# autoresearch — Embedding Optimization for Resource-Efficient Chat Models
 
-This is an experiment to have the LLM do its own research.
+This is an autonomous research experiment focused on a single question:
+
+> **What is the most resource-efficient embedding design that lets a small LLM reach good language quality — good enough for ChatGPT-like conversational use on minimal hardware?**
+
+The constraint is real: RTX A4000, 16 GB VRAM, 5-minute training budget per experiment. Every byte of VRAM saved in the embedding layer is a byte available for more transformer depth or wider attention. The goal is not just lower val_bpb — it's lower val_bpb *per MB of embedding memory used*.
 
 ## Setup
 
@@ -12,7 +16,7 @@ To set up a new experiment, work with the user to:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
+4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `python prepare.py` (no uv on this cloud kernel).
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
 
@@ -20,23 +24,61 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Each experiment runs on a single GPU (RTX A4000, 16 GB VRAM). The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). Launch it as: `python train.py` (no uv on this cloud kernel).
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, embedding design, etc.
 
 **What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
+- Modify `prepare.py`. It is read-only.
+- Install new packages beyond what is already installed (`einops`, `bitsandbytes`, `vector-quantize-pytorch`, `triton`, `scipy`, `scikit-learn` are all available).
 - Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+**The primary goal: get the lowest val_bpb while minimising embedding memory.** The secondary goal is for the resulting model to be practical for chat use on constrained hardware. These two goals align — a smaller, better-trained model is more useful than a large undertrained one.
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+**VRAM** is a hard constraint here (16 GB total). Keep `peak_vram_mb` well under 15000. If an experiment uses dramatically more VRAM without a proportional val_bpb gain, discard it.
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Removing code and getting equal or better results is a win.
 
 **The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+
+## Research focus: Embedding optimisation
+
+The current `train.py` already has **factorized embeddings** (`EMBED_RANK=64`): every `V×D` embedding table is decomposed into `V×r + r→D`. This is the starting point.
+
+Work through these ideas in order. For each, ask: does it lower val_bpb? Does it reduce `peak_vram_mb`? Is the code still clean?
+
+### Tier 1 — Sweep the rank (quick wins, run first)
+- `EMBED_RANK = 128` — more capacity, still 2.4× memory savings vs unfactorized
+- `EMBED_RANK = 32` — most aggressive compression, find the quality floor
+- `EMBED_RANK = 96` — try between if 64 and 128 are close
+
+### Tier 2 — Weight tying
+- **Tie `wte` ↔ `lm_head`**: share the same factorized embedding matrix for input and output. Standard trick in language models — saves the full lm_head table with no quality loss. Implement by having `lm_head.up.weight = wte.embed.weight` (transposed) after init.
+- **Shared value embeddings**: instead of a separate `FactorizedEmbedding` per VE layer, use one shared table projected differently per layer.
+
+### Tier 3 — Smarter embedding initialisation
+- Try **orthogonal init** for the embedding lookup table (`nn.init.orthogonal_`) — more spread in embedding space from step 0.
+- Try **scaled normal init** (`std = 1/sqrt(rank)`) for the projection — keeps embedding norms stable.
+
+### Tier 4 — Use EMBED_RANK to free up budget for depth
+- If rank=64 saves ~13M params, try reinvesting those params into depth: increase `DEPTH` from 6 to 7 or 8 while keeping factorized embeddings. Does more depth + factorized embeddings beat baseline depth + full embeddings?
+- Alternatively, increase `n_head` or widen the model slightly.
+
+### Tier 5 — Activation on the projection
+- Add a non-linearity between embed and proj in `FactorizedEmbedding`: `self.proj(F.silu(self.embed(idx)))`. Does a gated projection help or hurt?
+- Try `F.relu` or `F.gelu` — simpler, potentially faster.
+
+### Tier 6 — Quantised lookup table
+- Store the small `V×r` lookup table in int8 (bitsandbytes `bnb.nn.Embedding8bit` or manual quantize+dequantize). Halves the lookup table memory. The projection stays in bf16.
+
+### Tier 7 — Codebook embeddings (most experimental)
+- Use `vector_quantize_pytorch` to learn a codebook of ~256–512 codes. Each of the 8192 tokens is represented as a combination of codes. This is the most radical compression but hardest to train.
+
+### Ideas to avoid
+- Do not change the tokenizer or vocabulary size — `prepare.py` is fixed.
+- Do not add attention mechanisms to the embedding layer — too much complexity for marginal gain.
+- Do not try MoE-style embeddings unless all Tier 1–4 ideas are exhausted.
 
 ## Output format
 
@@ -96,7 +138,7 @@ LOOP FOREVER:
 1. Look at the git state: the current branch/commit we're on
 2. Tune `train.py` with an experimental idea by directly hacking the code.
 3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
+4. Run the experiment: `python train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
 5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
 6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
 7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
